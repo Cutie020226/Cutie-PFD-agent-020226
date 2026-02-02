@@ -8,7 +8,7 @@ import math
 import zipfile
 import hashlib
 import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 
 import streamlit as st
 import yaml
@@ -29,6 +29,7 @@ try:
     from anthropic import Anthropic
 except Exception:
     Anthropic = None
+
 
 # ----------------------------
 # 0) Constants / Defaults
@@ -125,11 +126,13 @@ I18N = {
         "upload_zip": "Upload ZIP Folder",
         "scan_path": "Scan Path (if accessible)",
         "scan": "Scan",
-        "trim_first_page": "Trim first page (cover/metadata)",
+        "pages_to_trim": "Pages to trim (1-based)",
+        "pages_to_trim_help": "Examples: 1   |  1-2  |  1,3,5  |  2-4,7. Leave blank for no trimming.",
         "summary_prompt": "Summary prompt",
         "model": "Model",
         "max_tokens": "Max tokens",
         "temperature": "Temperature",
+        "skip_summarized": "Skip already summarized documents",
         "toc_editor": "Master ToC (editable)",
         "toc_preview": "ToC Preview",
         "refresh_toc": "Refresh ToC from summaries",
@@ -189,11 +192,13 @@ I18N = {
         "upload_zip": "上傳 ZIP 資料夾",
         "scan_path": "掃描路徑（若可存取）",
         "scan": "掃描",
-        "trim_first_page": "裁切第一頁（封面/中繼資料）",
+        "pages_to_trim": "要裁切的頁面（從 1 開始）",
+        "pages_to_trim_help": "範例：1  |  1-2  |  1,3,5  |  2-4,7。留白表示不裁切。",
         "summary_prompt": "摘要提示詞",
         "model": "模型",
         "max_tokens": "最大 tokens",
         "temperature": "溫度",
+        "skip_summarized": "略過已完成摘要的文件",
         "toc_editor": "主 ToC（可編輯）",
         "toc_preview": "ToC 預覽",
         "refresh_toc": "由摘要更新 ToC",
@@ -320,7 +325,6 @@ def inject_wow_css():
       }}
       .wow-dot.ok   {{ background: #22C55E; box-shadow: 0 0 0 3px rgba(34,197,94,0.2); }}
       .wow-dot.bad  {{ background: #EF4444; box-shadow: 0 0 0 3px rgba(239,68,68,0.2); }}
-      .wow-dot.warn {{ background: #F59E0B; box-shadow: 0 0 0 3px rgba(245,158,11,0.2); }}
 
       .wow-muted {{ color: var(--wow-muted); }}
 
@@ -366,14 +370,20 @@ def ss_init():
     st.session_state.setdefault("cancel_requested", False)
     st.session_state.setdefault("processing_log", [])
 
-    st.session_state.setdefault("pdf_items", [])   # dicts: {id, name, source, bytes, path, text, meta}
+    # BUG FIX: registry of already-ingested PDF content hashes
+    st.session_state.setdefault("seen_pdf_hashes", set())  # type: ignore
+
+    st.session_state.setdefault("pdf_items", [])   # dicts: {id, name, source, bytes, path, text, meta, content_hash}
     st.session_state.setdefault("summaries", {})   # id -> summary md
     st.session_state.setdefault("toc_markdown", "")
 
-    st.session_state.setdefault("trim_first_page", True)
+    # Step 2 trimming controls
+    st.session_state.setdefault("pages_to_trim_spec", "1")  # default keeps original behavior (trim first page)
+
     st.session_state.setdefault("summary_model", "gemini-2.5-flash")
     st.session_state.setdefault("summary_max_tokens", 1500)
     st.session_state.setdefault("summary_temperature", 0.2)
+    st.session_state.setdefault("skip_summarized", True)
     st.session_state.setdefault(
         "summary_prompt",
         "Summarize the following regulatory/medical device document in 5–8 concise bullet points. "
@@ -420,6 +430,7 @@ def ss_init():
         "magics_applied": 0,
         "last_model": "",
         "last_run_at": None,
+        "pdf_duplicates_skipped": 0,
     })
 
 
@@ -447,6 +458,10 @@ def safe_filename(name: str) -> str:
     return name[:120] if len(name) > 120 else name
 
 
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
 # ----------------------------
 # 3) API Keys: env-first, sidebar fallback
 # ----------------------------
@@ -456,9 +471,6 @@ def env_key(provider: str) -> str:
 
 
 def get_effective_key(provider: str) -> Tuple[str, str]:
-    """
-    Returns: (key, source) where source is env|session|missing
-    """
     ek = env_key(provider)
     if ek:
         return ek, "env"
@@ -525,7 +537,7 @@ def load_agents_yaml() -> List[Dict[str, Any]]:
                 "name": "Compare & Contrast",
                 "category": "Synthesis",
                 "system_prompt": "",
-                "user_prompt_template": "Compare documents in the Master ToC: highlight similarities, differences, and key evidence/metrics. Provide structured headings and cite the document section titles/filenames.",
+                "user_prompt_template": "Compare documents in the Master ToC: highlight similarities, differences, and key evidence/metrics. Provide structured headings and cite filenames/sections.",
                 "default_model": "gpt-4o-mini",
                 "default_max_tokens": DEFAULT_MAX_TOKENS,
                 "default_temperature": 0.2,
@@ -626,6 +638,7 @@ def llm_call(model: str, system_prompt: str, user_prompt: str, max_tokens: int, 
             else:
                 parts.append(str(b))
         out = "".join(parts).strip()
+
     else:
         raise RuntimeError(f"Unknown provider '{provider}' for model '{model}'.")
 
@@ -644,21 +657,47 @@ def llm_call(model: str, system_prompt: str, user_prompt: str, max_tokens: int, 
 
 
 # ----------------------------
-# 6) PDF discovery / extraction
+# 6) PDF discovery / ingestion (DEDUP FIX)
 # ----------------------------
 
-def add_pdf_item_from_upload(name: str, pdf_bytes: bytes):
-    item_id = hashlib.sha256((name + str(len(pdf_bytes)) + str(time.time())).encode("utf-8")).hexdigest()[:16]
+def _seen_hashes() -> Set[str]:
+    # Streamlit session_state stores the set; typed helper for clarity
+    s = st.session_state.get("seen_pdf_hashes")
+    if not isinstance(s, set):
+        s = set()
+        st.session_state.seen_pdf_hashes = s
+    return s
+
+
+def add_pdf_item_from_upload(name: str, pdf_bytes: bytes, source: str = "upload", path: Optional[str] = None) -> bool:
+    """
+    Returns True if added, False if skipped as duplicate.
+    Dedup key: sha256(pdf_bytes)
+    """
+    content_hash = sha256_bytes(pdf_bytes)
+    seen = _seen_hashes()
+
+    if content_hash in seen:
+        st.session_state.metrics["pdf_duplicates_skipped"] += 1
+        log_event("Duplicate PDF skipped (same content hash)", data={"name": name, "hash": content_hash[:16], "source": source})
+        return False
+
+    seen.add(content_hash)
+    # Use content_hash prefix as stable ID -> prevents duplicates even if function is called repeatedly
+    item_id = content_hash[:16]
+
     st.session_state.pdf_items.append({
         "id": item_id,
         "name": safe_filename(name),
-        "source": "upload",
-        "bytes": pdf_bytes,
-        "path": None,
+        "source": source,
+        "bytes": pdf_bytes if source in ("upload", "zip") else None,
+        "path": path,
         "text": None,
         "meta": {},
+        "content_hash": content_hash,
     })
     st.session_state.metrics["pdf_found"] = len(st.session_state.pdf_items)
+    return True
 
 
 def discover_pdfs_from_zip(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
@@ -681,21 +720,84 @@ def discover_pdfs_from_path(root: str) -> List[str]:
     return pdfs
 
 
-def read_pdf_text(pdf_bytes: bytes, trim_first_page: bool) -> Tuple[str, Dict[str, Any]]:
-    meta = {"page_count": 0, "trimmed": False, "single_page": False, "no_text": False}
+# ----------------------------
+# 7) Trimming: parse page spec + extract text
+# ----------------------------
+
+def parse_pages_to_trim(spec: str, page_count: int) -> Set[int]:
+    """
+    spec examples (1-based):
+      "1"        -> {0}
+      "1-2"      -> {0,1}
+      "1,3,5"    -> {0,2,4}
+      "2-4,7"    -> {1,2,3,6}
+      "" or None -> empty set
+    Any out-of-range pages are ignored.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return set()
+    spec = spec.replace(" ", "")
+    out: Set[int] = set()
+
+    parts = [p for p in spec.split(",") if p]
+    for part in parts:
+        if "-" in part:
+            a, b = part.split("-", 1)
+            if not a.isdigit() or not b.isdigit():
+                continue
+            start = int(a)
+            end = int(b)
+            if start <= 0 or end <= 0:
+                continue
+            if end < start:
+                start, end = end, start
+            for p in range(start, end + 1):
+                idx = p - 1
+                if 0 <= idx < page_count:
+                    out.add(idx)
+        else:
+            if not part.isdigit():
+                continue
+            p = int(part)
+            if p <= 0:
+                continue
+            idx = p - 1
+            if 0 <= idx < page_count:
+                out.add(idx)
+    return out
+
+
+def read_pdf_text(pdf_bytes: bytes, pages_to_trim_spec: str) -> Tuple[str, Dict[str, Any]]:
+    meta = {
+        "page_count": 0,
+        "trim_spec": pages_to_trim_spec,
+        "trimmed_pages_0based": [],
+        "single_page": False,
+        "no_text": False,
+        "trim_override_used": False,
+    }
+
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = reader.pages
-    meta["page_count"] = len(pages)
-
-    start_idx = 0
-    if trim_first_page and len(pages) > 1:
-        start_idx = 1
-        meta["trimmed"] = True
-    if len(pages) == 1:
+    page_count = len(pages)
+    meta["page_count"] = page_count
+    if page_count == 1:
         meta["single_page"] = True
 
+    pages_to_trim = parse_pages_to_trim(pages_to_trim_spec, page_count)
+    meta["trimmed_pages_0based"] = sorted(list(pages_to_trim))
+
+    # Build kept pages list
+    kept_indices = [i for i in range(page_count) if i not in pages_to_trim]
+
+    # Safety: if user trimmed all pages, keep page 0 to avoid empty doc
+    if not kept_indices and page_count > 0:
+        kept_indices = [0]
+        meta["trim_override_used"] = True
+
     texts = []
-    for i in range(start_idx, len(pages)):
+    for i in kept_indices:
         try:
             txt = pages[i].extract_text() or ""
         except Exception:
@@ -711,7 +813,7 @@ def read_pdf_text(pdf_bytes: bytes, trim_first_page: bool) -> Tuple[str, Dict[st
 
 
 # ----------------------------
-# 7) Summaries + ToC
+# 8) Summaries + ToC
 # ----------------------------
 
 def summarize_document(doc_name: str, doc_text: str) -> str:
@@ -738,7 +840,7 @@ def build_master_toc() -> str:
 
 
 # ----------------------------
-# 8) Agents: single + pipeline
+# 9) Agents: single + pipeline
 # ----------------------------
 
 def normalize_agent_prompt(agent: Dict[str, Any], user_edited_prompt: str, context: str) -> Tuple[str, str]:
@@ -797,7 +899,7 @@ def default_step_dict() -> Dict[str, Any]:
 
 
 # ----------------------------
-# 9) Notes + keyword highlight + magics
+# 10) Notes + keyword highlight + magics
 # ----------------------------
 
 def extract_keywords_from_markdown(md: str) -> List[str]:
@@ -809,7 +911,6 @@ def extract_keywords_from_markdown(md: str) -> List[str]:
             line = re.sub(r"^[\-\*\d\.\)]\s*", "", line.strip())
             if line:
                 kw.extend([p.strip() for p in re.split(r"[,\u3001]", line) if p.strip()])
-
     if not kw:
         m2 = re.search(r"(?is)\bKeywords?\s*:\s*(.+)", md)
         if m2:
@@ -910,9 +1011,8 @@ def magic_apply(kind: str, note_md: str, model: str, max_tokens: int, temperatur
     return out
 
 
-
 # ----------------------------
-# 10) Sidebar WOW Control Center (KEY CHANGE)
+# 11) Sidebar WOW Control Center
 # ----------------------------
 
 def sidebar_control_center():
@@ -920,7 +1020,6 @@ def sidebar_control_center():
         st.markdown(f"### {t('control_center')}")
         st.caption("Theme • Language • Painter Style • API Keys")
 
-        # Theme toggle
         theme_choice = st.radio(
             t("theme"),
             options=["dark", "light"],
@@ -930,7 +1029,6 @@ def sidebar_control_center():
         )
         st.session_state.ui_theme = theme_choice
 
-        # Language
         lang_choice = st.selectbox(
             t("language"),
             options=["en", "zh-TW"],
@@ -939,7 +1037,6 @@ def sidebar_control_center():
         )
         st.session_state.ui_lang = lang_choice
 
-        # Painter Style + Game
         st.markdown("---")
         st.markdown(f"**{t('style')}**")
 
@@ -954,26 +1051,21 @@ def sidebar_control_center():
         arcade = st.empty()
 
         def spin_style(mode: str):
-            # "Spin" cycles quickly; "Jackpot" cycles longer and ends with a dramatic final pick
             cycles = 14 if mode == "spin" else 30
             delay = 0.06 if mode == "spin" else 0.045
             start = int(time.time() * 1000) % 10_000
             idx = start % len(PAINTER_STYLES)
-
-            for i in range(cycles):
+            for _ in range(cycles):
                 idx = (idx + 1) % len(PAINTER_STYLES)
                 arcade.markdown(
-                    f"<div class='wow-card'><b>{'🎰' if mode=='jackpot' else '🌀'}</b> "
-                    f"<span class='wow-muted'>Selecting…</span><br><b>{PAINTER_STYLES[idx]['name']}</b></div>",
+                    f"<div class='wow-card'><span class='wow-muted'>Selecting…</span><br><b>{PAINTER_STYLES[idx]['name']}</b></div>",
                     unsafe_allow_html=True
                 )
                 time.sleep(delay)
-
             final = (idx + (start % 7)) % len(PAINTER_STYLES)
             st.session_state.ui_style = PAINTER_STYLES[final]["id"]
             arcade.markdown(
-                f"<div class='wow-card'><span class='wow-dot ok'></span> "
-                f"<b>Selected:</b> {PAINTER_STYLES[final]['name']}</div>",
+                f"<div class='wow-card'><span class='wow-dot ok'></span> <b>Selected:</b> {PAINTER_STYLES[final]['name']}</div>",
                 unsafe_allow_html=True
             )
             st.toast(f"{t('style')}: {PAINTER_STYLES[final]['name']}")
@@ -986,22 +1078,19 @@ def sidebar_control_center():
             if st.button(t("jackpot"), use_container_width=True):
                 spin_style("jackpot")
 
-        # API Keys (env-first; show inputs only if env not set)
         st.markdown("---")
         st.markdown(f"### {t('api_keys')}")
 
         def key_line(provider: str, label: str):
-            k, src = get_effective_key(provider)
+            _, src = get_effective_key(provider)
             if src == "env":
                 st.markdown(
                     f"<div class='wow-pill'><span class='wow-dot ok'></span><b>{label}</b>"
                     f"<span class='wow-muted'>{t('connected_env')}</span></div>",
                     unsafe_allow_html=True
                 )
-                # IMPORTANT: Do not show input, do not show key
                 return
 
-            # Missing or session: show input (password)
             st.markdown(
                 f"<div class='wow-pill'><span class='wow-dot {'ok' if src=='session' else 'bad'}'></span>"
                 f"<b>{label}</b><span class='wow-muted'>{t('connected_session') if src=='session' else t('missing')}</span></div>",
@@ -1020,11 +1109,10 @@ def sidebar_control_center():
 
 
 # ----------------------------
-# 11) Header / status strip
+# 12) Header / status strip
 # ----------------------------
 
 def wow_header():
-    m = st.session_state.metrics
     stage = st.session_state.pipeline_stage
     docs = len(st.session_state.pdf_items)
     toc_ready = bool(st.session_state.toc_markdown.strip())
@@ -1066,7 +1154,7 @@ def wow_header():
 
 
 # ----------------------------
-# 12) Pages: Workspace / Agents / Notes / Dashboard
+# 13) Pages: Workspace / Agents / Notes / Dashboard
 # ----------------------------
 
 def workspace_page():
@@ -1074,20 +1162,40 @@ def workspace_page():
     st.markdown("### Step 1 — Load Documents")
 
     c1, c2 = st.columns([1.2, 1.0])
+
     with c1:
         up_pdfs = st.file_uploader(t("upload_pdfs"), type=["pdf"], accept_multiple_files=True)
         if up_pdfs:
+            added = 0
+            skipped = 0
             for f in up_pdfs:
-                add_pdf_item_from_upload(f.name, f.read())
-            st.toast(f"Added {len(up_pdfs)} PDF(s)")
+                # Use getvalue() so reruns reliably get bytes (not empty due to pointer)
+                b = f.getvalue()
+                if add_pdf_item_from_upload(f.name, b, source="upload"):
+                    added += 1
+                else:
+                    skipped += 1
+            if added:
+                st.toast(f"Added {added} PDF(s)")
+            if skipped:
+                st.info(f"Skipped {skipped} duplicate PDF(s)")
+
     with c2:
         up_zip = st.file_uploader(t("upload_zip"), type=["zip"], accept_multiple_files=False)
         if up_zip is not None:
             try:
-                found = discover_pdfs_from_zip(up_zip.read())
+                found = discover_pdfs_from_zip(up_zip.getvalue())
+                added = 0
+                skipped = 0
                 for name, b in found:
-                    add_pdf_item_from_upload(name, b)
-                st.toast(f"ZIP: found {len(found)} PDF(s)")
+                    if add_pdf_item_from_upload(name, b, source="zip"):
+                        added += 1
+                    else:
+                        skipped += 1
+                if added:
+                    st.toast(f"ZIP: added {added} PDF(s)")
+                if skipped:
+                    st.info(f"ZIP: skipped {skipped} duplicate PDF(s)")
             except Exception as e:
                 log_event("ZIP extraction failed", level="error", data={"error": str(e)})
                 st.error(f"ZIP extraction failed: {e}")
@@ -1102,6 +1210,8 @@ def workspace_page():
         try:
             set_stage("Scanning")
             pdf_paths = discover_pdfs_from_path(path.strip())
+            # For path sources, we do not content-hash at scan-time (could be expensive).
+            # We still dedupe by path id to prevent exact duplicates from repeated scans.
             for p in pdf_paths:
                 item_id = hashlib.sha256(p.encode("utf-8")).hexdigest()[:16]
                 if any(x["id"] == item_id for x in st.session_state.pdf_items):
@@ -1114,6 +1224,7 @@ def workspace_page():
                     "path": p,
                     "text": None,
                     "meta": {},
+                    "content_hash": None,
                 })
             st.session_state.metrics["pdf_found"] = len(st.session_state.pdf_items)
             set_stage("Idle")
@@ -1123,17 +1234,28 @@ def workspace_page():
             log_event("Path scan failed", level="error", data={"error": str(e)})
             st.error(f"Path scan failed: {e}")
 
-    st.session_state.trim_first_page = st.toggle(t("trim_first_page"), value=st.session_state.trim_first_page)
+    # New: pages-to-trim input
+    st.text_input(
+        t("pages_to_trim"),
+        key="pages_to_trim_spec",
+        help=t("pages_to_trim_help"),
+        placeholder="1",
+    )
 
     cA, cB, cC = st.columns([1.4, 1.0, 1.0])
     with cA:
-        st.selectbox(t("model"), SUPPORTED_MODELS, key="summary_model",
-                     index=SUPPORTED_MODELS.index(st.session_state.summary_model) if st.session_state.summary_model in SUPPORTED_MODELS else 0)
+        st.selectbox(
+            t("model"),
+            SUPPORTED_MODELS,
+            key="summary_model",
+            index=SUPPORTED_MODELS.index(st.session_state.summary_model) if st.session_state.summary_model in SUPPORTED_MODELS else 0,
+        )
     with cB:
         st.number_input(t("max_tokens"), min_value=256, max_value=20000, step=256, key="summary_max_tokens")
     with cC:
         st.slider(t("temperature"), 0.0, 1.0, float(st.session_state.summary_temperature), 0.05, key="summary_temperature")
 
+    st.checkbox(t("skip_summarized"), key="skip_summarized")
     st.text_area(t("summary_prompt"), key="summary_prompt", height=120)
 
     run_btn = st.button(t("run_pipeline"), use_container_width=True)
@@ -1152,6 +1274,7 @@ def workspace_page():
             total = len(st.session_state.pdf_items)
             prog = st.progress(0)
             status = st.status("Processing PDFs…", expanded=True)
+
             try:
                 set_stage("Trimming / Extracting")
 
@@ -1162,17 +1285,24 @@ def workspace_page():
 
                     sid, name = item["id"], item["name"]
 
-                    # Load bytes from upload or path
+                    # Optional: skip if already summarized
+                    if st.session_state.skip_summarized and sid in st.session_state.summaries:
+                        status.write(f"Skipping (already summarized): {name}")
+                        prog.progress(i / total)
+                        continue
+
+                    # Load bytes
                     try:
-                        if item["source"] == "upload":
+                        if item["source"] in ("upload", "zip"):
                             pdf_bytes = item["bytes"]
                         elif item["source"] == "path":
                             with open(item["path"], "rb") as f:
                                 pdf_bytes = f.read()
+                            # If desired, we could dedupe by content hash here, but we keep it simple.
                         else:
                             pdf_bytes = item.get("bytes")
 
-                        text, meta = read_pdf_text(pdf_bytes, trim_first_page=st.session_state.trim_first_page)
+                        text, meta = read_pdf_text(pdf_bytes, pages_to_trim_spec=st.session_state.pages_to_trim_spec)
                         item["text"] = text
                         item["meta"] = meta
                         if meta.get("no_text"):
@@ -1182,21 +1312,21 @@ def workspace_page():
                     except Exception as e:
                         errors += 1
                         log_event("PDF extraction failed", level="error", data={"name": name, "error": str(e)})
-                        status.write(f"❌ Extraction failed: {name} — {e}")
+                        status.write(f"Extraction failed: {name} — {e}")
                         prog.progress(i / total)
                         continue
 
                     # Summarize
                     try:
                         set_stage("Summarizing")
-                        status.write(f"🧠 Summarizing: {name}")
+                        status.write(f"Summarizing: {name}")
                         md = summarize_document(name, item["text"])
                         st.session_state.summaries[sid] = md
                         ok += 1
                     except Exception as e:
                         errors += 1
                         log_event("Summarization failed", level="error", data={"name": name, "error": str(e)})
-                        status.write(f"❌ Summarization failed: {name} — {e}")
+                        status.write(f"Summarization failed: {name} — {e}")
 
                     prog.progress(i / total)
 
@@ -1322,18 +1452,17 @@ def agent_studio_page():
         return
 
     step_labels = [
-        f"Step {i+1}: {next((a['name'] for a in agents if a['id']==s['agent_id']), 'Agent')}"
+        f"Step {i+1}: {next((a['name'] for a in agents if a['id'] == s['agent_id']), 'Agent')}"
         for i, s in enumerate(st.session_state.agent_steps)
     ]
     st.session_state.agent_active_step = st.selectbox(
         "Active step",
         list(range(len(step_labels))),
         format_func=lambda i: step_labels[i],
-        index=min(st.session_state.agent_active_step, len(step_labels)-1),
+        index=min(st.session_state.agent_active_step, len(step_labels) - 1),
     )
     s = st.session_state.agent_steps[st.session_state.agent_active_step]
 
-    # Step config
     agent_idx = agent_ids.index(s["agent_id"]) if s["agent_id"] in agent_ids else 0
     picked_agent = st.selectbox(t("select_agent"), agent_names, index=agent_idx, key=f"pipe_agent_{s['id']}")
     s["agent_id"] = agent_ids[agent_names.index(picked_agent)]
@@ -1341,15 +1470,15 @@ def agent_studio_page():
     c1, c2, c3 = st.columns([1.4, 1.0, 1.0])
     with c1:
         s["model"] = st.selectbox(t("model"), SUPPORTED_MODELS,
-                                 index=SUPPORTED_MODELS.index(s["model"]) if s["model"] in SUPPORTED_MODELS else 0,
-                                 key=f"pipe_model_{s['id']}")
+                                  index=SUPPORTED_MODELS.index(s["model"]) if s["model"] in SUPPORTED_MODELS else 0,
+                                  key=f"pipe_model_{s['id']}")
     with c2:
         s["max_tokens"] = st.number_input(t("max_tokens"), min_value=256, max_value=20000, step=256,
                                           value=int(s["max_tokens"]), key=f"pipe_max_{s['id']}")
     with c3:
         s["temperature"] = st.slider(t("temperature"), 0.0, 1.0, float(s["temperature"]), 0.05, key=f"pipe_temp_{s['id']}")
 
-    s["prompt"] = st.text_area("Prompt (editable)", value=s.get("prompt",""), height=140, key=f"pipe_prompt_{s['id']}")
+    s["prompt"] = st.text_area("Prompt (editable)", value=s.get("prompt", ""), height=140, key=f"pipe_prompt_{s['id']}")
 
     s["input_mode"] = st.radio(
         t("input_source"),
@@ -1360,7 +1489,7 @@ def agent_studio_page():
         key=f"pipe_inmode_{s['id']}",
     )
     if s["input_mode"] == "custom":
-        s["custom_input"] = st.text_area("Custom input", value=s.get("custom_input",""), height=120, key=f"pipe_custom_{s['id']}")
+        s["custom_input"] = st.text_area("Custom input", value=s.get("custom_input", ""), height=120, key=f"pipe_custom_{s['id']}")
 
     def step_input(i: int) -> str:
         step = st.session_state.agent_steps[i]
@@ -1370,7 +1499,7 @@ def agent_studio_page():
             return step.get("custom_input", "")
         if i == 0:
             return toc
-        prev = st.session_state.agent_steps[i-1]
+        prev = st.session_state.agent_steps[i - 1]
         return (prev.get("output_text") or prev.get("output_md") or toc)
 
     cR1, cR2 = st.columns(2)
@@ -1396,6 +1525,7 @@ def agent_studio_page():
                 set_stage("Idle")
                 log_event("Pipeline step failed", level="error", data={"error": str(e)})
                 st.error(f"Step failed: {e}")
+
     with cR2:
         if st.button(t("run_all"), use_container_width=True):
             try:
@@ -1424,10 +1554,11 @@ def agent_studio_page():
     view = st.radio("View", ["text", "markdown"], index=1, horizontal=True,
                     format_func=lambda x: "Text" if x == "text" else "Markdown",
                     key=f"pipe_view_{s['id']}")
+
     if view == "text":
-        s["output_text"] = st.text_area("", value=s.get("output_text",""), height=240, key=f"pipe_outtext_{s['id']}")
+        s["output_text"] = st.text_area("", value=s.get("output_text", ""), height=240, key=f"pipe_outtext_{s['id']}")
     else:
-        s["output_md"] = st.text_area("Markdown (editable)", value=s.get("output_md",""), height=240, key=f"pipe_outmd_{s['id']}")
+        s["output_md"] = st.text_area("Markdown (editable)", value=s.get("output_md", ""), height=240, key=f"pipe_outmd_{s['id']}")
         st.markdown("Preview:")
         st.markdown(s["output_md"] or "_(empty)_")
 
@@ -1588,6 +1719,7 @@ def dashboard_page():
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div class='wow-card' style='margin-top:12px;'>", unsafe_allow_html=True)
+    st.write("Duplicates skipped:", m.get("pdf_duplicates_skipped", 0))
     st.write("Last model:", m.get("last_model") or "-")
     st.write("Last run at:", m.get("last_run_at") or "-")
     st.write("Current stage:", st.session_state.pipeline_stage)
@@ -1599,7 +1731,7 @@ def dashboard_page():
 
 
 # ----------------------------
-# 13) Main
+# 14) Main
 # ----------------------------
 
 def main():
@@ -1619,7 +1751,6 @@ def main():
     wow_header()
 
     tabs = st.tabs([t("workspace"), t("agents"), t("notes"), t("dashboard")])
-
     with tabs[0]:
         workspace_page()
     with tabs[1]:
